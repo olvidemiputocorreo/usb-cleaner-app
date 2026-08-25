@@ -1,8 +1,12 @@
 import sys
 import os
 import shutil
+import hashlib
 from pathlib import Path
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox, QMessageBox, QProgressBar
+from datetime import datetime
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                             QPushButton, QLabel, QComboBox, QMessageBox, QProgressBar, QTableWidget, 
+                             QTableWidgetItem, QCheckBox, QScrollArea)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 import psutil
@@ -68,22 +72,104 @@ class LimpiarThread(QThread):
         else:
             self.finalizado.emit("No se encontraron archivos grandes")
 
+class DuplicadosThread(QThread):
+    progreso = pyqtSignal(int)
+    duplicados_encontrados = pyqtSignal(list)
+    finalizado = pyqtSignal(str)
+    
+    def __init__(self, ruta):
+        super().__init__()
+        self.ruta = ruta
+    
+    def calcular_hash(self, archivo):
+        """Calcula el hash SHA256 de un archivo"""
+        sha256 = hashlib.sha256()
+        try:
+            with open(archivo, 'rb') as f:
+                for bloque in iter(lambda: f.read(4096), b''):
+                    sha256.update(bloque)
+            return sha256.hexdigest()
+        except:
+            return None
+    
+    def run(self):
+        self.progreso.emit(0)
+        self.progreso.emit(10)
+        self.progreso.emit("Buscando duplicados...")
+        
+        archivos_hash = {}
+        duplicados = []
+        
+        try:
+            archivos = list(Path(self.ruta).rglob("*"))
+            total = len(archivos)
+            
+            for idx, item in enumerate(archivos):
+                if item.is_file():
+                    try:
+                        hash_archivo = self.calcular_hash(str(item))
+                        if hash_archivo:
+                            if hash_archivo in archivos_hash:
+                                # Ya existe, es un duplicado
+                                archivo_viejo = archivos_hash[hash_archivo]
+                                archivo_nuevo = item
+                                
+                                # Determinar cuál es más antiguo
+                                fecha_viejo = datetime.fromtimestamp(archivo_viejo['stat'].st_mtime)
+                                fecha_nuevo = datetime.fromtimestamp(archivo_nuevo.stat().st_mtime)
+                                
+                                if fecha_viejo < fecha_nuevo:
+                                    eliminar = archivo_viejo['ruta']
+                                    mantener = str(archivo_nuevo)
+                                else:
+                                    eliminar = str(archivo_nuevo)
+                                    mantener = archivo_viejo['ruta']
+                                
+                                duplicados.append({
+                                    'mantener': mantener,
+                                    'eliminar': eliminar,
+                                    'tamaño': archivo_nuevo.stat().st_size / (1024 * 1024),
+                                    'hash': hash_archivo
+                                })
+                            else:
+                                archivos_hash[hash_archivo] = {
+                                    'ruta': str(item),
+                                    'stat': item.stat()
+                                }
+                    except:
+                        pass
+                
+                progreso = int((idx / total) * 90) + 10
+                self.progreso.emit(progreso)
+            
+            self.progreso.emit(100)
+            self.duplicados_encontrados.emit(duplicados)
+            
+            if duplicados:
+                total_mb = sum(d['tamaño'] for d in duplicados)
+                self.finalizado.emit(f"✅ Se encontraron {len(duplicados)} duplicados ({total_mb:.2f} MB)")
+            else:
+                self.finalizado.emit("No se encontraron duplicados")
+        except Exception as e:
+            self.finalizado.emit(f"Error: {str(e)}")
+
 class USBCleaner(QMainWindow):
     def __init__(self):
         super().__init__()
         self.thread = None
+        self.duplicados_lista = []
         self.init_ui()
     
     def init_ui(self):
-        self.setWindowTitle("🧹 USB Cleaner")
-        self.setGeometry(100, 100, 600, 400)
+        self.setWindowTitle("🧹 USB Cleaner Pro")
+        self.setGeometry(100, 100, 800, 600)
         
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout()
         
         # Título
-        titulo = QLabel("USB CLEANER - Limpiador de USB")
+        titulo = QLabel("USB CLEANER - Limpiador Inteligente de USB")
         titulo.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         layout.addWidget(titulo)
         
@@ -95,7 +181,7 @@ class USBCleaner(QMainWindow):
         usb_layout.addWidget(self.usb_combo)
         layout.addLayout(usb_layout)
         
-        # Botones
+        # Botones principales
         btn_layout = QHBoxLayout()
         
         btn_temp = QPushButton("🗑️ Limpiar Temp")
@@ -106,7 +192,24 @@ class USBCleaner(QMainWindow):
         btn_grande.clicked.connect(self.mostrar_grandes)
         btn_layout.addWidget(btn_grande)
         
+        btn_duplicados = QPushButton("🔍 Buscar Duplicados")
+        btn_duplicados.clicked.connect(self.buscar_duplicados)
+        btn_layout.addWidget(btn_duplicados)
+        
         layout.addLayout(btn_layout)
+        
+        # Tabla de duplicados
+        self.tabla_duplicados = QTableWidget()
+        self.tabla_duplicados.setColumnCount(4)
+        self.tabla_duplicados.setHorizontalHeaderLabels(["✓", "Archivo a Eliminar", "Tamaño (MB)", "Mantener"])
+        self.tabla_duplicados.setVisible(False)
+        layout.addWidget(self.tabla_duplicados)
+        
+        # Botones de duplicados
+        self.btn_eliminar_duplicados = QPushButton("🗑️ Eliminar Seleccionados")
+        self.btn_eliminar_duplicados.clicked.connect(self.eliminar_duplicados_seleccionados)
+        self.btn_eliminar_duplicados.setVisible(False)
+        layout.addWidget(self.btn_eliminar_duplicados)
         
         # Barra de progreso
         self.progreso = QProgressBar()
@@ -150,6 +253,81 @@ class USBCleaner(QMainWindow):
         self.thread = LimpiarThread(usb, "grande")
         self.thread.finalizado.connect(self.limpieza_finalizada)
         self.thread.start()
+    
+    def buscar_duplicados(self):
+        usb = self.obtener_usb_seleccionada()
+        self.progreso.setVisible(True)
+        self.status.setText("Buscando duplicados... (esto puede tardar)")
+        self.tabla_duplicados.setVisible(False)
+        self.btn_eliminar_duplicados.setVisible(False)
+        
+        self.thread = DuplicadosThread(usb)
+        self.thread.progreso.connect(self.actualizar_progreso)
+        self.thread.duplicados_encontrados.connect(self.mostrar_duplicados)
+        self.thread.finalizado.connect(self.limpieza_finalizada)
+        self.thread.start()
+    
+    def actualizar_progreso(self, valor):
+        if isinstance(valor, int):
+            self.progreso.setValue(valor)
+        else:
+            self.status.setText(valor)
+    
+    def mostrar_duplicados(self, duplicados):
+        self.duplicados_lista = duplicados
+        self.tabla_duplicados.setRowCount(0)
+        
+        for idx, dup in enumerate(duplicados):
+            self.tabla_duplicados.insertRow(idx)
+            
+            # Checkbox (seleccionado por defecto)
+            checkbox = QCheckBox()
+            checkbox.setChecked(True)
+            self.tabla_duplicados.setCellWidget(idx, 0, checkbox)
+            
+            # Archivo a eliminar
+            item_eliminar = QTableWidgetItem(Path(dup['eliminar']).name)
+            self.tabla_duplicados.setItem(idx, 1, item_eliminar)
+            
+            # Tamaño
+            item_tamaño = QTableWidgetItem(f"{dup['tamaño']:.2f} MB")
+            self.tabla_duplicados.setItem(idx, 2, item_tamaño)
+            
+            # Archivo a mantener
+            item_mantener = QTableWidgetItem(Path(dup['mantener']).name)
+            self.tabla_duplicados.setItem(idx, 3, item_mantener)
+        
+        self.tabla_duplicados.setVisible(True)
+        self.btn_eliminar_duplicados.setVisible(True)
+    
+    def eliminar_duplicados_seleccionados(self):
+        seleccionados = []
+        for idx in range(self.tabla_duplicados.rowCount()):
+            checkbox = self.tabla_duplicados.cellWidget(idx, 0)
+            if checkbox.isChecked():
+                seleccionados.append(self.duplicados_lista[idx]['eliminar'])
+        
+        if not seleccionados:
+            QMessageBox.warning(self, "Aviso", "Selecciona al menos un archivo para eliminar")
+            return
+        
+        respuesta = QMessageBox.question(self, "Confirmar", 
+                                        f"¿Eliminar {len(seleccionados)} archivos duplicados?")
+        if respuesta == QMessageBox.StandardButton.Yes:
+            bytes_liberados = 0
+            for archivo in seleccionados:
+                try:
+                    tamaño = Path(archivo).stat().st_size
+                    Path(archivo).unlink()
+                    bytes_liberados += tamaño
+                except Exception as e:
+                    self.status.setText(f"Error eliminando {archivo}: {e}")
+            
+            mb = bytes_liberados / (1024 * 1024)
+            QMessageBox.information(self, "Éxito", f"✅ Liberados: {mb:.2f} MB")
+            self.tabla_duplicados.setVisible(False)
+            self.btn_eliminar_duplicados.setVisible(False)
+            self.status.setText("Listo")
     
     def actualizar_status(self, mensaje):
         self.status.setText(mensaje)
